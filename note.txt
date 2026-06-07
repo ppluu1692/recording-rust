@@ -1,0 +1,753 @@
+
+Claude finished the response
+Tôi đang làm một ứng dụng rust để học tập
+  - Mục tiêu: ghi âm từ mic và âm thanh hệ thống đồng thời, ghi ra hai file
+    audio wav
+  - Viết theo dạng các hàm nhỏ để sau này dễ nâng cấp mở rộng hãy hướng dẫn tôi
+    từng bước nhé
+
+20:40
+Tôi sẽ hướng dẫn bạn từng bước xây dựng ứng dụng Rust ghi âm. Hãy bắt đầu từ cơ bản!
+
+Tổng quan kiến trúc
+src/
+├── main.rs          # Entry point
+├── recorder.rs      # Logic ghi âm chính
+├── audio_device.rs  # Quản lý thiết bị âm thanh
+└── wav_writer.rs    # Ghi file WAV
+Bước 1: Khởi tạo project và dependencies
+bash
+cargo new audio_recorder
+cd audio_recorder
+Thêm vào Cargo.toml:
+
+toml
+[
+package
+]
+name = "audio_recorder"
+version = "0.1.0"
+edition = "2021"
+
+[
+dependencies
+]
+cpal = "0.15"          # Cross-platform audio I/O
+hound = "3.5"          # Đọc/ghi file WAV
+anyhow = "1.0"         # Error handling tiện lợi
+ctrlc = "3.4"          # Bắt Ctrl+C để dừng ghi
+Bước 2: wav_writer.rs — Module ghi file WAV
+Module nhỏ nhất, không phụ thuộc gì khác — bắt đầu từ đây:
+
+rust
+// src/wav_writer.rs
+use anyhow::Result;
+use hound::{WavWriter, WavSpec, SampleFormat};
+use std::sync::{Arc, Mutex};
+
+pub type SharedWavWriter = Arc<Mutex<Option<WavWriter<std::io::BufWriter<std::fs::File>>>>>;
+
+/// Tạo WAV writer với thông số cho trước
+pub fn create_wav_writer(path: &str, channels: u16, sample_rate: u32) -> Result<WavWriter<std::io::BufWriter<std::fs::File>>> {
+    let spec = WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let writer = WavWriter::create(path, spec)?;
+    Ok(writer)
+}
+
+/// Bọc writer trong Arc<Mutex> để chia sẻ giữa các thread
+pub fn wrap_writer(writer: WavWriter<std::io::BufWriter<std::fs::File>>) -> SharedWavWriter {
+    Arc::new(Mutex::new(Some(writer)))
+}
+
+/// Ghi một batch samples vào writer
+pub fn write_samples(shared: &SharedWavWriter, samples: &[f32]) -> Result<()> {
+    if let Ok(mut guard) = shared.lock() {
+        if let Some(writer) = guard.as_mut() {
+            for &sample in samples {
+                writer.write_sample(sample)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Finalize và đóng file WAV
+pub fn finalize_writer(shared: &SharedWavWriter) -> Result<()> {
+    if let Ok(mut guard) = shared.lock() {
+        if let Some(writer) = guard.take() {
+            writer.finalize()?;
+        }
+    }
+    Ok(())
+}
+Bước 3: audio_device.rs — Quản lý thiết bị
+rust
+// src/audio_device.rs
+use anyhow::{Result, anyhow};
+use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::{Device, Host, SupportedStreamConfig};
+
+/// Lấy default host của hệ thống
+pub fn get_host() -> Host {
+    cpal::default_host()
+}
+
+/// Lấy microphone mặc định
+pub fn get_microphone(host: &Host) -> Result<Device> {
+    host.default_input_device()
+        .ok_or_else(|| anyhow!("Không tìm thấy microphone"))
+}
+
+/// Lấy thiết bị output mặc định (để loopback)
+pub fn get_system_audio(host: &Host) -> Result<Device> {
+    // Trên Windows: WASAPI loopback
+    // Trên Linux: cần PulseAudio monitor source
+    // Trên macOS: cần virtual device (BlackHole, etc.)
+    host.default_output_device()
+        .ok_or_else(|| anyhow!("Không tìm thấy output device"))
+}
+
+/// Lấy config được hỗ trợ của device
+pub fn get_input_config(device: &Device) -> Result<SupportedStreamConfig> {
+    let config = device.default_input_config()?;
+    println!(
+        "  Config: {} channels, {} Hz, {:?}",
+        config.channels(),
+        config.sample_rate().0,
+        config.sample_format()
+    );
+    Ok(config)
+}
+
+/// In danh sách tất cả input devices (debug)
+pub fn list_input_devices(host: &Host) -> Result<()> {
+    println!("=== Input Devices ===");
+    for device in host.input_devices()? {
+        println!("  - {}", device.name()?);
+    }
+    Ok(())
+}
+
+/// In danh sách tất cả output devices (debug)  
+pub fn list_output_devices(host: &Host) -> Result<()> {
+    println!("=== Output Devices ===");
+    for device in host.output_devices()? {
+        println!("  - {}", device.name()?);
+    }
+    Ok(())
+}
+Bước 4: recorder.rs — Logic ghi âm chính
+rust
+// src/recorder.rs
+use anyhow::Result;
+use cpal::{Device, SupportedStreamConfig, Stream, SampleFormat};
+use cpal::traits::{DeviceTrait, StreamTrait};
+use crate::wav_writer::{SharedWavWriter, write_samples};
+
+/// Build input stream từ device và ghi vào WAV writer
+pub fn build_input_stream(
+    device: &Device,
+    config: &SupportedStreamConfig,
+    writer: SharedWavWriter,
+    label: &str,  // "mic" hoặc "system" — để log
+) -> Result<Stream> {
+    let label = label.to_string();
+    let err_label = label.clone();
+    
+    let stream = match config.sample_format() {
+        SampleFormat::F32 => build_stream_f32(device, config, writer, label)?,
+        SampleFormat::I16 => build_stream_i16(device, config, writer, label)?,
+        SampleFormat::U16 => build_stream_u16(device, config, writer, label)?,
+        _ => anyhow::bail!("Sample format không được hỗ trợ"),
+    };
+    
+    Ok(stream)
+}
+
+fn build_stream_f32(device: &Device, config: &SupportedStreamConfig, writer: SharedWavWriter, label: String) -> Result<Stream> {
+    let stream = device.build_input_stream(
+        &config.config(),
+        move |data: &[f32], _| {
+            if let Err(e) = write_samples(&writer, data) {
+                eprintln!("[{}] Lỗi ghi samples: {}", label, e);
+            }
+        },
+        move |err| eprintln!("[{}] Stream error: {}", label, err),  // sửa err_label
+        None,
+    )?;
+    Ok(stream)
+}
+
+fn build_stream_i16(device: &Device, config: &SupportedStreamConfig, writer: SharedWavWriter, label: String) -> Result<Stream> {
+    let stream = device.build_input_stream(
+        &config.config(),
+        move |data: &[i16], _| {
+            // Convert i16 -> f32 normalized [-1.0, 1.0]
+            let converted: Vec<f32> = data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+            if let Err(e) = write_samples(&writer, &converted) {
+                eprintln!("[{}] Lỗi ghi samples: {}", label, e);
+            }
+        },
+        move |err| eprintln!("[{}] Stream error: {}", label, err),
+        None,
+    )?;
+    Ok(stream)
+}
+
+fn build_stream_u16(device: &Device, config: &SupportedStreamConfig, writer: SharedWavWriter, label: String) -> Result<Stream> {
+    let stream = device.build_input_stream(
+        &config.config(),
+        move |data: &[u16], _| {
+            // Convert u16 -> f32 normalized [-1.0, 1.0]
+            let converted: Vec<f32> = data.iter().map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0).collect();
+            if let Err(e) = write_samples(&writer, &converted) {
+                eprintln!("[{}] Lỗi ghi samples: {}", label, e);
+            }
+        },
+        move |err| eprintln!("[{}] Stream error: {}", label, err),
+        None,
+    )?;
+    Ok(stream)
+}
+
+/// Bắt đầu stream
+pub fn start_stream(stream: &Stream) -> Result<()> {
+    stream.play()?;
+    Ok(())
+}
+
+/// Dừng stream
+pub fn stop_stream(stream: &Stream) -> Result<()> {
+    stream.pause()?;
+    Ok(())
+}
+Bước 5: main.rs — Kết hợp tất cả
+rust
+// src/main.rs
+mod audio_device;
+mod recorder;
+mod wav_writer;
+
+use anyhow::Result;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use cpal::traits::StreamTrait;
+
+fn main() -> Result<()> {
+    println!("🎙️  Audio Recorder — Nhấn Ctrl+C để dừng\n");
+
+    // 1. Khởi tạo host và liệt kê devices
+    let host = audio_device::get_host();
+    audio_device::list_input_devices(&host)?;
+    audio_device::list_output_devices(&host)?;
+    println!();
+
+    // 2. Lấy devices
+    let mic_device = audio_device::get_microphone(&host)?;
+    let sys_device = audio_device::get_system_audio(&host)?;
+    println!("🎤 Mic: {}", mic_device.name()?);
+    println!("🔊 System: {}", sys_device.name()?);
+
+    // 3. Lấy configs
+    let mic_config = audio_device::get_input_config(&mic_device)?;
+    let sys_config = audio_device::get_input_config(&sys_device)?;
+
+    // 4. Tạo WAV writers
+    let mic_writer = wav_writer::wrap_writer(wav_writer::create_wav_writer(
+        "mic_output.wav",
+        mic_config.channels(),
+        mic_config.sample_rate().0,
+    )?);
+
+    let sys_writer = wav_writer::wrap_writer(wav_writer::create_wav_writer(
+        "system_output.wav",
+        sys_config.channels(),
+        sys_config.sample_rate().0,
+    )?);
+
+    // 5. Build streams
+    let mic_stream = recorder::build_input_stream(&mic_device, &mic_config, mic_writer.clone(), "mic")?;
+    let sys_stream = recorder::build_input_stream(&sys_device, &sys_config, sys_writer.clone(), "system")?;
+
+    // 6. Bắt đầu ghi
+    mic_stream.play()?;
+    sys_stream.play()?;
+    println!("\n⏺️  Đang ghi âm...");
+
+    // 7. Chờ Ctrl+C
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })?;
+
+    while running.load(Ordering::SeqCst) {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // 8. Dừng và lưu file
+    println!("\n⏹️  Đang dừng...");
+    mic_stream.pause()?;
+    sys_stream.pause()?;
+
+    wav_writer::finalize_writer(&mic_writer)?;
+    wav_writer::finalize_writer(&sys_writer)?;
+
+    println!("✅ Đã lưu: mic_output.wav và system_output.wav");
+    Ok(())
+}
+Bước 6: Chạy thử
+bash
+cargo run
+Lưu ý quan trọng theo từng OS
+OS	System Audio	Ghi chú
+Windows	WASAPI Loopback	Tự động, chỉ cần chọn đúng output device
+Linux	PulseAudio monitor	Cần dùng device Monitor of ...
+macOS	Cần virtual device	Cài BlackHole hoặc Soundflower
+Bước tiếp theo có thể mở rộng
+Chọn device bằng CLI args — thêm clap crate
+Ghi có timestamp — đặt tên file theo giờ
+Mix hai track thành một — xử lý sau khi ghi
+Real-time volume meter — hiển thị level âm thanh
+Bạn đang dùng OS nào? Tôi sẽ hướng dẫn cụ thể hơn cho phần system audio loopback!
+
+bạn đang dùng cách nào để giao tiếp giữa các thread? crossbeam-channel có tốt hơn không
+
+20:42
+Phân tích cách giao tiếp thread hiện tại
+Trong code trên, tôi đang dùng Arc<Mutex<T>> — cụ thể là:
+
+rust
+pub type SharedWavWriter = Arc<Mutex<Option<WavWriter<...>>>>;
+Luồng hoạt động hiện tại
+Audio callback thread ──[lock Mutex]──► WavWriter ──► file.wav
+Audio callback thread ──[lock Mutex]──► WavWriter ──► file.wav
+Vấn đề: Audio callback được gọi với độ trễ cực thấp (real-time). Nếu Mutex đang bị lock bởi thread khác → callback bị block → audio bị drop/glitch.
+
+So sánh các phương pháp
+1. Arc<Mutex<T>> — đang dùng
+rust
+// Callback ghi thẳng vào file qua Mutex
+move |data: &[f32], _| {
+    let mut guard = writer.lock().unwrap(); // ❌ có thể block!
+    guard.write_sample(sample)?;
+}
+✅	Đơn giản, dễ hiểu
+❌	Mutex có thể block audio callback
+❌	Ghi file I/O trong real-time thread — rất tệ
+❌	lock() không có thời gian chờ cố định
+2. crossbeam-channel — tốt hơn đáng kể
+Audio callback ──[send]──► channel ──[recv]──► Writer thread ──► file.wav
+   (real-time)    non-blocking        blocking ok here
+rust
+// Callback chỉ send, không bao giờ block
+move |data: &[f32], _| {
+    let _ = tx.send(data.to_vec()); // ✅ gần như không tốn thời gian
+}
+
+// Thread riêng lo việc ghi file
+while let Ok(samples) = rx.recv() {
+    writer.write_samples(&samples)?; // I/O ở đây là ok
+}
+✅	Callback không bao giờ block
+✅	Tách biệt real-time thread và I/O thread
+✅	crossbeam nhanh hơn std::sync::mpsc
+⚠️	Nếu channel đầy → vẫn có thể drop samples
+3. Lock-free ring buffer — tốt nhất cho audio
+Đây là cách các ứng dụng audio chuyên nghiệp dùng (JUCE, PortAudio...):
+
+Audio callback ──[write]──► RingBuffer ──[read]──► Writer thread
+                lock-free!
+Dùng crate ringbuf:
+
+rust
+// Callback ghi vào ring buffer — KHÔNG CÓ LOCK
+move |data: &[f32], _| {
+    producer.push_slice(data); // atomic, wait-free
+}
+Kết luận: nên dùng gì?
+Dự án học tập, đơn giản    →  Arc<Mutex>  (hiện tại)
+Muốn tốt hơn, thực tế hơn  →  crossbeam-channel  ✅ recommended
+Audio production-grade      →  ringbuf (lock-free)
+Refactor sang crossbeam-channel
+Bạn có muốn tôi viết lại recorder.rs và wav_writer.rs theo pattern channel không? Sẽ rõ ràng hơn nhiều và sát với thực tế production hơn.
+
+sao không dùng ringbuf luôn, so sánh ringbuf với crossbeam, giải pháp nào tốt hơn nếu sau này tôi stream audio chứ không phải ghi ra file nữa
+
+20:45
+So sánh kỹ: ringbuf vs crossbeam-channel
+
+
+Phân tích chi tiết
+Tại sao không dùng ringbuf luôn từ đầu?
+Vì ringbuf có một điểm yếu quan trọng: khi bạn cần gửi nhiều loại lệnh khác nhau (không chỉ samples), nó bất tiện hơn crossbeam. Ví dụ sau này bạn muốn gửi cả StartRecord, StopRecord, FlushBuffer — với channel bạn làm ngay bằng enum, với ringbuf phải tự xây thêm lớp protocol.
+
+So sánh thẳng vào code
+ringbuf — callback write không bao giờ block:
+
+rust
+// Cargo.toml
+ringbuf = "0.4"
+
+// setup
+let ring = HeapRb::<f32>::new(4096 * 8);
+let (mut prod, mut cons) = ring.split();
+
+// audio callback — wait-free
+move |data: &[f32], _| {
+    let pushed = prod.push_slice(data);
+    if pushed < data.len() {
+        // buffer đầy → drop samples, nhưng KHÔNG block
+    }
+}
+
+// writer thread
+loop {
+    let n = cons.pop_slice(&mut buf);
+    writer.write(&buf[..n])?;
+}
+crossbeam-channel — linh hoạt hơn, dễ mở rộng:
+
+rust
+// Cargo.toml
+crossbeam-channel = "0.5"
+
+// Có thể gửi cả lệnh điều khiển lẫn data
+enum AudioMsg {
+    Samples(Vec<f32>),
+    Stop,
+    Flush,
+}
+
+let (tx, rx) = crossbeam_channel::bounded(512);
+
+// callback — gần như lock-free với bounded channel
+move |data: &[f32], _| {
+    let _ = tx.try_send(AudioMsg::Samples(data.to_vec()));
+    // try_send không block, trả Err nếu đầy
+}
+
+// writer thread
+while let Ok(msg) = rx.recv() {
+    match msg {
+        AudioMsg::Samples(s) => writer.write(&s)?,
+        AudioMsg::Stop => break,
+        AudioMsg::Flush => writer.flush()?,
+    }
+}
+Nếu sau này stream audio (WebSocket/RTP)
+Đây là câu trả lời quan trọng: kết hợp cả hai là tốt nhất:
+
+Audio callback
+    ↓ ringbuf (lock-free, zero-copy)
+Encode thread (Opus/PCM)
+    ↓ crossbeam-channel (gửi encoded packets)
+Network thread (WebSocket/RTP)
+ringbuf giữ real-time thread hoàn toàn sạch
+crossbeam-channel lo phần protocol/điều khiển giữa các stage sau
+Quyết định cuối
+Mục tiêu	Nên dùng
+Ghi file WAV đơn giản	crossbeam-channel đủ tốt
+Muốn latency thấp nhất	ringbuf
+Có thể stream sau này	ringbuf + crossbeam-channel kết hợp
+Cần gửi lệnh điều khiển	crossbeam-channel
+Bạn muốn tôi refactor code sang pattern kết hợp ringbuf + crossbeam luôn không? Vừa chuẩn cho streaming sau này, vừa đúng cách audio production làm.
+
+vậy hãy dùng ringbuf + crossbeam-channel kết hợp cho dự án này đi, vì mục tiêu sau này sẽ là stream
+
+20:47
+
+Check available skills
+Check available skills
+Được, tôi sẽ viết toàn bộ project với architecture rõ ràng. Để tôi tạo từng file một.
+
+
+Created 6 files, ran 3 commands
+Created 6 files, ran 3 commands
+
+Create project structure
+
+Script
+
+Cargo.toml with all dependencies
+Cargo.toml
+
+pipeline.rs - AudioMessage enum và kiểu dữ liệu dùng chung
+pipeline.rs
+
+audio_device.rs - quản lý thiết bị âm thanh
+audio_device.rs
+
+capture.rs - audio callback dùng ringbuf, drain thread dùng crossbeam
+capture.rs
+
+writer.rs - nhận AudioMessage từ channel, ghi ra WAV file
+writer.rs
+
+main.rs - kết nối toàn bộ pipeline
+main.rs
+
+Check code compiles
+
+Script
+
+Find cargo binary
+
+Script
+Done
+Rust chưa được cài trong môi trường này nên không thể chạy cargo check, nhưng toàn bộ code đã sẵn sàng. Để tôi copy ra output và review lại logic một lần nữa.
+
+
+Ran a command, read a file
+Ran a command, read a file
+Tổng quan kiến trúc
+[Mic callback]    → ringbuf → drain-mic    → ch_mic    → writer-mic    → mic.wav
+[System callback] → ringbuf → drain-system → ch_system → writer-system → system.wav
+Mỗi nguồn audio có pipeline độc lập, 3 tầng rõ ràng:
+
+Tầng 1 — capture.rs (ringbuf)
+
+Audio callback chỉ gọi push_slice() — wait-free, không lock, không alloc
+Drain thread poll ring buffer mỗi 5ms, gom thành batches
+Tầng 2 — pipeline.rs (crossbeam-channel)
+
+AudioMessage enum: Samples, Stop, Flush
+Dễ thêm lệnh điều khiển sau này mà không đụng vào callback
+Tầng 3 — writer.rs (AudioSink trait)
+
+WavSink ghi ra file hiện tại
+Khi muốn stream, chỉ cần implement AudioSink cho WebSocketSink hoặc RtpSink rồi đổi một dòng trong main.rs
+Cách chạy
+bash
+cd audio_recorder
+cargo run
+# Nhấn Ctrl+C để dừng → tự lưu mic_output.wav + system_output.wav
+Khi muốn chuyển sang stream
+Chỉ cần thêm sink mới, không đụng vào capture.rs hay pipeline.rs:
+
+rust
+// stream_sink.rs
+pub struct WebSocketSink { socket: WebSocket<...> }
+
+impl AudioSink for WebSocketSink {
+    fn write_samples(&mut self, samples: &[f32]) -> Result<()> {
+        let bytes = samples_to_opus(samples); // encode
+        self.socket.send(Message::Binary(bytes))?;
+        Ok(())
+    }
+    fn flush(&mut self) -> Result<()> { Ok(()) }
+    fn finalize(self: Box<Self>) -> Result<()> { Ok(()) }
+}
+
+// main.rs — đổi đúng một dòng:
+let mic_sink = Box::new(WebSocketSink::connect("ws://...")?);
+
+Main
+RS 
+
+Capture
+RS 
+
+Writer
+RS 
+
+Pipeline
+RS 
+
+Audio device
+RS 
+
+Cargo
+TOML 
+
+Next time, try this in Cowork
+
+Hand off complex tasks for Claude to handle independently. Come back to finished results.
+
+
+
+
+
+Claude is AI and can make mistakes. Please double-check responses.
+Capture · RS
+/// capture.rs
+///
+/// Tầng 1 của pipeline:
+///
+///   [Audio callback]  →  ringbuf (lock-free)  →  [Drain thread]  →  crossbeam-channel
+///
+/// Audio callback chỉ được gọi push_slice() — wait-free, không bao giờ block.
+/// Drain thread đọc ring buffer và gửi batches qua channel tới writer/stream thread.
+use anyhow::Result;
+use cpal::{
+    traits::{DeviceTrait, StreamTrait},
+    Device, SampleFormat, Stream, SupportedStreamConfig,
+};
+use crossbeam_channel::Sender;
+use ringbuf::{
+    traits::{Consumer, Producer, Split},
+    HeapRb,
+};
+use std::{thread, time::Duration};
+ 
+use crate::pipeline::AudioMessage;
+ 
+/// Dung lượng ring buffer tính bằng số f32 samples.
+/// 4096 * 16 ≈ 1.5 giây buffer ở 44100Hz stereo — đủ dư cho bất kỳ writer nào.
+const RING_CAPACITY: usize = 4096 * 16;
+ 
+/// Khoảng thời gian drain thread ngủ giữa các lần poll ring buffer.
+/// 5ms là cân bằng tốt: latency thấp nhưng không waste CPU.
+const DRAIN_INTERVAL_MS: u64 = 5;
+ 
+/// Số samples đọc mỗi lần drain (một "batch").
+const DRAIN_BATCH: usize = 1024;
+ 
+/// Khởi tạo toàn bộ capture pipeline cho một device:
+///   - Tạo ring buffer
+///   - Build cpal input stream (callback ghi vào ring buffer)
+///   - Spawn drain thread (đọc ring buffer, gửi qua channel)
+///
+/// Trả về Stream (phải giữ sống) và JoinHandle của drain thread.
+pub fn start_capture(
+    device: &Device,
+    config: &SupportedStreamConfig,
+    tx: Sender<AudioMessage>,
+    label: &str,
+) -> Result<(Stream, thread::JoinHandle<()>)> {
+    let ring = HeapRb::<f32>::new(RING_CAPACITY);
+    let (prod, cons) = ring.split();
+ 
+    let stream = build_input_stream(device, config, prod, label)?;
+    stream.play()?;
+ 
+    let handle = spawn_drain_thread(cons, tx, label);
+ 
+    Ok((stream, handle))
+}
+ 
+/// Dừng capture: pause stream rồi gửi Stop qua channel.
+pub fn stop_capture(stream: &Stream, tx: &Sender<AudioMessage>) -> Result<()> {
+    stream.pause()?;
+    let _ = tx.send(AudioMessage::Stop);
+    Ok(())
+}
+ 
+// ─── private ────────────────────────────────────────────────────────────────
+ 
+type RingProd = ringbuf::wrap::caching::Caching<
+    std::sync::Arc<ringbuf::storage::Heap<f32>>,
+    true,
+    ringbuf::wrap::direct::Direct<std::sync::Arc<ringbuf::storage::Heap<f32>>, true>,
+>;
+ 
+type RingCons = ringbuf::wrap::caching::Caching<
+    std::sync::Arc<ringbuf::storage::Heap<f32>>,
+    false,
+    ringbuf::wrap::direct::Direct<std::sync::Arc<ringbuf::storage::Heap<f32>>, false>,
+>;
+ 
+/// Build cpal input stream với sample format tự động.
+/// Callback chỉ làm một việc: push_slice vào ring buffer — wait-free.
+fn build_input_stream(
+    device: &Device,
+    config: &SupportedStreamConfig,
+    mut prod: RingProd,
+    label: &str,
+) -> Result<Stream> {
+    let label_err = label.to_string();
+ 
+    let stream = match config.sample_format() {
+        SampleFormat::F32 => {
+            device.build_input_stream(
+                &config.config(),
+                move |data: &[f32], _| {
+                    let written = prod.push_slice(data);
+                    if written < data.len() {
+                        // Ring buffer đầy: drop phần dư, KHÔNG block.
+                        // Sau này có thể emit metric / increment counter ở đây.
+                    }
+                },
+                move |e| eprintln!("[{}] stream error: {}", label_err, e),
+                None,
+            )?
+        }
+ 
+        SampleFormat::I16 => {
+            device.build_input_stream(
+                &config.config(),
+                move |data: &[i16], _| {
+                    // Convert i16 → f32 normalized [-1.0, 1.0]
+                    // to_vec để tránh alloc trong hot path; dùng SmallVec nếu cần tối ưu hơn.
+                    let converted: Vec<f32> =
+                        data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
+                    let _ = prod.push_slice(&converted);
+                },
+                move |e| eprintln!("[{}] stream error: {}", label_err, e),
+                None,
+            )?
+        }
+ 
+        SampleFormat::U16 => {
+            device.build_input_stream(
+                &config.config(),
+                move |data: &[u16], _| {
+                    let converted: Vec<f32> = data
+                        .iter()
+                        .map(|&s| (s as f32 / u16::MAX as f32) * 2.0 - 1.0)
+                        .collect();
+                    let _ = prod.push_slice(&converted);
+                },
+                move |e| eprintln!("[{}] stream error: {}", label_err, e),
+                None,
+            )?
+        }
+ 
+        fmt => anyhow::bail!("Sample format {:?} không được hỗ trợ", fmt),
+    };
+ 
+    Ok(stream)
+}
+ 
+/// Spawn drain thread: poll ring buffer mỗi DRAIN_INTERVAL_MS,
+/// gửi batches qua crossbeam-channel tới writer/stream thread.
+///
+/// Tại sao poll thay vì wait-free notify?
+/// Đơn giản hơn và DRAIN_INTERVAL_MS = 5ms là đủ thấp.
+/// Nếu sau này cần latency < 1ms, thay bằng Parker/Unparker của crossbeam.
+fn spawn_drain_thread(
+    mut cons: RingCons,
+    tx: Sender<AudioMessage>,
+    label: &str,
+) -> thread::JoinHandle<()> {
+    let label = label.to_string();
+    let mut batch = vec![0f32; DRAIN_BATCH];
+ 
+    thread::Builder::new()
+        .name(format!("drain-{}", label))
+        .spawn(move || loop {
+            let n = cons.pop_slice(&mut batch);
+ 
+            if n > 0 {
+                let samples = batch[..n].to_vec();
+                // Nếu channel đầy (writer quá chậm), try_send drop batch này.
+                // Tốt hơn block drain thread — block sẽ backup vào ring buffer.
+                if tx.try_send(AudioMessage::Samples(samples)).is_err() {
+                    eprintln!("[{}] channel đầy, drop batch {} samples", label, n);
+                }
+            }
+ 
+            // Kiểm tra channel còn sống không (writer đã drop sender kia).
+            if tx.is_disconnected() {
+                break;
+            }
+ 
+            thread::sleep(Duration::from_millis(DRAIN_INTERVAL_MS));
+        })
+        .expect("spawn drain thread thất bại")
+}
+ 
