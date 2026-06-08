@@ -10,6 +10,7 @@ mod audio_device;
 mod capture;
 mod pipeline;
 mod writer;
+mod processor;
 
 use anyhow::Result;
 use cpal::traits::DeviceTrait;
@@ -19,8 +20,10 @@ use std::sync::{
     Arc,
 };
 
-use pipeline::StreamConfig;
-use writer::{WavSink, spawn_writer_thread};
+// use pipeline::StreamConfig;
+// use writer::{WavSink, spawn_writer_thread};
+
+use crate::{pipeline::StreamConfig, processor::{MonoDownmixSink, ResamplerSink}, writer::{WavSink, spawn_writer_thread}};
 
 /// Kích thước crossbeam channel (số AudioMessage tối đa trong hàng đợi).
 /// 512 * 1024 samples * 4 bytes ≈ 2MB buffer — thoải mái cho writer bị slow.
@@ -51,7 +54,7 @@ fn main() -> Result<()> {
     let sys_cfg = StreamConfig::new("system", sys_hw_cfg.channels(), sys_hw_cfg.sample_rate());
 
     println!(
-        "   {}    → {} ch, {} Hz",
+        "   {} → {} ch, {} Hz",
         mic_cfg.label, mic_cfg.channels, mic_cfg.sample_rate
     );
     println!(
@@ -66,9 +69,17 @@ fn main() -> Result<()> {
     let (sys_tx, sys_rx) = bounded(CHANNEL_CAPACITY);
 
     // ── 4. Writer threads ──────────────────────────────────────────────────
-    // Đổi WavSink → WebSocketSink / RtpSink ở đây khi muốn stream.
-    let mic_sink = Box::new(WavSink::new("mic_output.wav", &mic_cfg)?);
-    let sys_sink = Box::new(WavSink::new("system_output.wav", &sys_cfg)?);
+    let mic_target_cfg = StreamConfig::new("mic", 1, 16000);
+    let sys_target_cfg = StreamConfig::new("system", 1, 16000);
+
+    let mic_wav_sink = Box::new(WavSink::new("mic_output.wav", &mic_target_cfg)?);
+    let sys_wav_sink = Box::new(WavSink::new("system_output.wav", &sys_target_cfg)?);
+
+    let mic_resampler = Box::new(ResamplerSink::new(mic_wav_sink, mic_cfg.sample_rate, 16000)?);
+    let sys_resampler = Box::new(ResamplerSink::new(sys_wav_sink, sys_cfg.sample_rate, 16000)?);
+
+    let mic_sink: Box<dyn writer::AudioSink> = Box::new(MonoDownmixSink::new(mic_resampler, mic_cfg.channels));
+    let sys_sink: Box<dyn writer::AudioSink> = Box::new(MonoDownmixSink::new(sys_resampler, sys_cfg.channels));
 
     let mic_writer = spawn_writer_thread(mic_rx, mic_sink, "mic".into());
     let sys_writer = spawn_writer_thread(sys_rx, sys_sink, "system".into());
@@ -92,7 +103,20 @@ fn main() -> Result<()> {
         })?;
     }
 
+    let duration_limit = std::env::var("RECORD_DURATION_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
+
+    let start_time = std::time::Instant::now();
+
     while running.load(Ordering::SeqCst) {
+        if let Some(limit) = duration_limit {
+            if start_time.elapsed() >= limit {
+                println!("\n⏱️  Tự động dừng sau {} giây.", limit.as_secs());
+                break;
+            }
+        }
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
