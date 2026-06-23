@@ -4,16 +4,28 @@ use cpal::{
     Device, Host, SupportedStreamConfig,
 };
 
+pub struct RecordingDevices {
+    pub mic: Option<Device>,
+    pub speaker: Option<Device>,
+}
+
 pub fn get_host() -> Host {
     cpal::default_host()
 }
 
-pub fn get_microphone(host: &Host) -> Result<Device> {
-    host.default_input_device().context("Can not found microphone")
+pub fn get_default_mic(host: &Host) -> Option<Device> {
+    host.default_input_device()
 }
 
-pub fn get_system_audio(host: &Host) -> Result<Device> {
-    host.default_output_device().context("Can not found loopback capture")
+pub fn get_default_speaker(host: &Host) -> Option<Device> {
+    host.default_output_device()
+}
+
+pub fn get_default_devices(host: &Host) -> RecordingDevices {
+    RecordingDevices { 
+        mic: get_default_mic(host), 
+        speaker: get_default_speaker(host),
+    }
 }
 
 pub fn get_input_config(device: &Device) -> Result<SupportedStreamConfig> {
